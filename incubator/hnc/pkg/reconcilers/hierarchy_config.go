@@ -107,6 +107,18 @@ func (r *HierarchyConfigReconciler) reconcile(ctx context.Context, log logr.Logg
 		return err
 	}
 
+	// Get hns instance before the forest lock in syncWithForest.
+	hasHNS := false
+	ownedHNSs := make(map[string]bool)
+	if r.HNSReconcilerEnabled {
+		hasHNS = r.hasHNS(ctx, nm)
+		log.Info("hnsyg hasHNS?", "hasHNS", hasHNS)
+
+		for _, ns := range r.getHNSs(ctx, nm) {
+			ownedHNSs[ns] = true
+		}
+	}
+
 	origHC := inst.DeepCopy()
 	origNS := nsInst.DeepCopy()
 
@@ -121,7 +133,7 @@ func (r *HierarchyConfigReconciler) reconcile(ctx context.Context, log logr.Logg
 	}
 
 	// Sync the Hierarchy singleton with the in-memory forest.
-	r.syncWithForest(log, nsInst, inst)
+	r.syncWithForest(log, nsInst, inst, hasHNS, ownedHNSs)
 
 	// Early exit if we don't need to write anything back.
 	if !update {
@@ -151,10 +163,13 @@ func (r *HierarchyConfigReconciler) reconcile(ctx context.Context, log logr.Logg
 // be able to proceed until this one is finished. While the results of the reconiliation may not be
 // fully written back to the apiserver yet, each namespace is reconciled in isolation (apart from
 // the in-memory forest) so this is fine.
-func (r *HierarchyConfigReconciler) syncWithForest(log logr.Logger, nsInst *corev1.Namespace, inst *api.HierarchyConfiguration) {
+func (r *HierarchyConfigReconciler) syncWithForest(log logr.Logger, nsInst *corev1.Namespace, inst *api.HierarchyConfiguration, hasHNS bool, ownedHNSs map[string]bool) {
 	r.Forest.Lock()
 	defer r.Forest.Unlock()
 	ns := r.Forest.Get(inst.ObjectMeta.Namespace)
+
+	// todo yg
+	ns.SetAllowCascadingDelete(inst.Spec.AllowCascadingDelete)
 
 	// Handle missing namespaces. It could be created if it's been requested as a subnamespace.
 	if r.onMissingNamespace(log, ns, nsInst) {
@@ -167,11 +182,11 @@ func (r *HierarchyConfigReconciler) syncWithForest(log logr.Logger, nsInst *core
 
 	r.markExisting(log, ns)
 
-	r.syncRequiredChildOf(log, inst, ns)
+	r.syncRequiredChildOf(log, inst, ns, nsInst, hasHNS)
 	r.syncParent(log, inst, ns)
 
 	// Update the list of actual children, then resolve it versus the list of required children.
-	r.syncChildren(log, inst, ns)
+	r.syncChildren(log, inst, ns, ownedHNSs)
 
 	r.syncLabel(log, nsInst, ns)
 
@@ -224,7 +239,7 @@ func (r *HierarchyConfigReconciler) markExisting(log logr.Logger, ns *forest.Nam
 // syncRequiredChildOf propagates the required child value from the forest to the spec if possible
 // (the spec itself will be synced next), or removes the requiredChildOf value if there's a problem
 // and notifies the would-be parent namespace.
-func (r *HierarchyConfigReconciler) syncRequiredChildOf(log logr.Logger, inst *api.HierarchyConfiguration, ns *forest.Namespace) {
+func (r *HierarchyConfigReconciler) syncRequiredChildOf(log logr.Logger, inst *api.HierarchyConfiguration, ns *forest.Namespace, nsInst *corev1.Namespace, hasHNS bool) {
 	if ns.RequiredChildOf == "" {
 		return
 	}
@@ -235,9 +250,30 @@ func (r *HierarchyConfigReconciler) syncRequiredChildOf(log logr.Logger, inst *a
 		inst.Spec.Parent = ns.RequiredChildOf
 	case ns.RequiredChildOf:
 		// ok
+		log.Info("hnsyg struct ok!")
 		if r.HNSReconcilerEnabled {
-			// Enqueue HNS to update the state to "Ok".
-			r.hnsr.enqueue(log, ns.Name(), ns.RequiredChildOf, "the HNS state should be updated to ok")
+			// The hns doesn't exist.
+			if !hasHNS {
+				log.Info("hnsyg - no hns")
+				// TODO yg PARENT.allowCascading! not itself!!
+				if ns.Parent().AllowCascadingDelete() || !ns.Parent().Exists() {
+					// TODO check hc.allowCascadingDelete
+					log.Info("hnsyg cascadingDelete allowed, deleting")
+					ns.RequiredChildOf = ""
+					ns.SetAllowCascadingDelete(true)
+					// Reset nsInst.CreationTimestamp so the writeInstance can delete the namespace.
+					nsInst.CreationTimestamp.Reset()
+					r.enqueueAffected(log, "relative of the going-to-delete namespace", ns.RelativesNames()...)
+				} else {
+					log.Info("hnsyg cascadingDelete not allowed, setting HNSmissing condition")
+					msg := fmt.Sprintf("HNS of self-serve subnamespace \"%s\" is missing in the owner namespace \"%s\"", ns.Name(), ns.RequiredChildOf)
+					ns.SetCondition(ns.RequiredChildOf, api.HNSMissing, msg)
+				}
+			} else {
+				ns.ClearConditions(ns.RequiredChildOf, api.HNSMissing)
+				// Enqueue HNS to update the state to "Ok".
+				r.hnsr.enqueue(log, ns.Name(), ns.RequiredChildOf, "the HNS state should be updated to ok")
+			}
 		}
 	default:
 		if r.HNSReconcilerEnabled {
@@ -322,7 +358,7 @@ func (r *HierarchyConfigReconciler) syncLabel(log logr.Logger, nsInst *corev1.Na
 // syncChildren looks at the current list of children and compares it to the children that
 // have been marked as required. If any required children are missing, we add them to the in-memory
 // forest and enqueue the (missing) child for reconciliation; we also handle various error cases.
-func (r *HierarchyConfigReconciler) syncChildren(log logr.Logger, inst *api.HierarchyConfiguration, ns *forest.Namespace) {
+func (r *HierarchyConfigReconciler) syncChildren(log logr.Logger, inst *api.HierarchyConfiguration, ns *forest.Namespace, ownedHNSs map[string]bool) {
 	// Update the most recent list of children from the forest
 	inst.Status.Children = ns.ChildNames()
 
@@ -366,6 +402,16 @@ func (r *HierarchyConfigReconciler) syncChildren(log logr.Logger, inst *api.Hier
 			r.enqueueAffected(log, "forest out-of-sync: requiredChildOf != parent", cns.RequiredChildOf)
 			if r.HNSReconcilerEnabled {
 				r.hnsr.enqueue(log, cn, cns.RequiredChildOf, "forest out-of-sync: owner != parent")
+			}
+		}
+
+		// TOdo yg Needed!!
+		if r.HNSReconcilerEnabled {
+			if cns.RequiredChildOf == ns.Name() {
+				// if HNS missing
+				if !ownedHNSs[cn] {
+					r.enqueueAffected(log, "the hns for the owned-child is missing", cn)
+				}
 			}
 		}
 
@@ -554,20 +600,27 @@ func (r *HierarchyConfigReconciler) writeNamespace(ctx context.Context, log logr
 	}
 
 	stats.WriteNamespace()
-	if inst.CreationTimestamp.IsZero() {
-		log.Info("Creating namespace on apiserver")
-		if err := r.Create(ctx, inst); err != nil {
-			log.Error(err, "while creating on apiserver")
+	if !orig.CreationTimestamp.IsZero() && inst.CreationTimestamp.IsZero() {
+		log.Info("Deleting namespace on apiserver")
+		if err := r.Delete(ctx, inst); err != nil {
+			log.Error(err, "while deleting on apiserver")
 			return false, err
 		}
 	} else {
-		log.Info("Updating namespace on apiserver")
-		if err := r.Update(ctx, inst); err != nil {
-			log.Error(err, "while updating apiserver")
-			return false, err
+		if inst.CreationTimestamp.IsZero() {
+			log.Info("Creating namespace on apiserver")
+			if err := r.Create(ctx, inst); err != nil {
+				log.Error(err, "while creating on apiserver")
+				return false, err
+			}
+		} else {
+			log.Info("Updating namespace on apiserver")
+			if err := r.Update(ctx, inst); err != nil {
+				log.Error(err, "while updating apiserver")
+				return false, err
+			}
 		}
 	}
-
 	return true, nil
 }
 
@@ -617,6 +670,57 @@ func (r *HierarchyConfigReconciler) getNamespace(ctx context.Context, nm string)
 		return &corev1.Namespace{}, nil
 	}
 	return ns, nil
+}
+
+// hasHNS returns true if the hns of the subnamespace exists in the owner namespace.
+func (r *HierarchyConfigReconciler) hasHNS(ctx context.Context, nm string) bool {
+	r.Forest.Lock()
+	pnm := r.Forest.Get(nm).RequiredChildOf
+	r.Forest.Unlock()
+	if pnm == "" {
+		return false
+	}
+
+	hns, _ := r.hnsr.getInstance(ctx, pnm, nm)
+	if hns.CreationTimestamp.IsZero() {
+		return false
+	}
+	return true
+}
+
+// hasHNS returns true if the hns of the subnamespace exists in the owner namespace.
+func (r *HierarchyConfigReconciler) getHNSs(ctx context.Context, nm string) (hnss []string) {
+	r.Forest.Lock()
+	onms := r.Forest.Get(nm).OwnedNames()
+	r.Forest.Unlock()
+
+	for _, onm := range onms {
+		hns, _ := r.hnsr.getInstance(ctx, nm, onm)
+		if !hns.CreationTimestamp.IsZero() {
+			hnss = append(hnss, onm)
+		}
+	}
+	return hnss
+}
+
+// Helper functions to check and remove string from a slice of strings.
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(slice []string, s string) (result []string) {
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		result = append(result, item)
+	}
+	return
 }
 
 func (r *HierarchyConfigReconciler) SetupWithManager(mgr ctrl.Manager, maxReconciles int) error {

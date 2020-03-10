@@ -57,18 +57,32 @@ func (r *HierarchicalNamespaceReconciler) Reconcile(req ctrl.Request) (ctrl.Resu
 	nm := req.Name
 	pnm := req.Namespace
 
-	// Get instance from apiserver. If the instance doesn't exist, we don't want to reconcile
+	// Get the self-serve namespace's hierarchyConfig and namespace instances.
+	hcInst, nsInst, err := r.hcr.GetInstances(ctx, log, nm)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Get the hns instance from apiserver. If the instance doesn't exist, we don't want to reconcile
 	// it since it may trigger the HC reconciler to recreate the namespace that was just deleted.
 	// TODO expand on this to check the owner's hc.spec.allowCascadingDelete. If it's set to
 	//  true, we still want to reconcile the hns instance. See issue:
 	//  https://github.com/kubernetes-sigs/multi-tenancy/issues/501
 	inst, err := r.getInstance(ctx, pnm, nm)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			// If the instance doesn't exist, return nil to prevent a retry.
+		return ctrl.Result{}, err
+	}
+
+	// The HNS instance doesn't exist.
+	if inst.CreationTimestamp.IsZero() {
+		if nsInst.Name == "" {
+			// If the hns and the subnamespace don't exist, return nil to prevent a retry.
+			return ctrl.Result{}, nil
+		} else {
+			// TODO change below to check cascadingDelete
+			r.hcr.enqueueAffected(log, "hnsyg of self-serve subnamespace is missing in the owner namespace", nm)
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, err
 	}
 
 	// Report "Forbidden" state and early exist if the namespace is not allowed to self-serve
@@ -78,12 +92,6 @@ func (r *HierarchicalNamespaceReconciler) Reconcile(req ctrl.Request) (ctrl.Resu
 	if EX[pnm] {
 		inst.Status.State = api.Forbidden
 		return ctrl.Result{}, r.writeInstance(ctx, log, inst)
-	}
-
-	// Get the self-serve namespace's hierarchyConfig and namespace instances.
-	hcInst, nsInst, err := r.hcr.GetInstances(ctx, log, nm)
-	if err != nil {
-		return ctrl.Result{}, err
 	}
 
 	r.syncWithForest(log, inst, nsInst, hcInst)
@@ -167,6 +175,8 @@ func (r *HierarchicalNamespaceReconciler) syncExisting(log logr.Logger, inst *ap
 	case pnm:
 		log.Info("Setting the HierarchicalNamespace state to Ok")
 		inst.Status.State = api.Ok
+		// todo yg
+		r.hcr.enqueueAffected(log, "update hc conditions", nm)
 	default:
 		log.Info("Self-serve subnamespace is already owned by another parent", "child", nm, "intendedParent", pnm, "actualParent", hcInst.Spec.Parent)
 		inst.Status.State = api.Conflict
@@ -190,7 +200,13 @@ func (r *HierarchicalNamespaceReconciler) getInstance(ctx context.Context, pnm, 
 	nsn := types.NamespacedName{Namespace: pnm, Name: nm}
 	inst := &api.HierarchicalNamespace{}
 	if err := r.Get(ctx, nsn, inst); err != nil {
-		return nil, err
+		if !errors.IsNotFound(err) {
+			return nil, err
+		}
+
+		// It doesn't exist - initialize it.
+		inst.ObjectMeta.Name = nm
+		inst.ObjectMeta.Namespace = pnm
 	}
 	return inst, nil
 }

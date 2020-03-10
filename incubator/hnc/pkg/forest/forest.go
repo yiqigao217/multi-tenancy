@@ -140,11 +140,12 @@ const Local = ""
 // Namespace represents a namespace in a forest. Other than its structure, it contains some
 // properties useful to the reconcilers.
 type Namespace struct {
-	forest   *Forest
-	name     string
-	parent   *Namespace
-	children namedNamespaces
-	exists   bool
+	forest               *Forest
+	name                 string
+	parent               *Namespace
+	children             namedNamespaces
+	exists               bool
+	allowCascadingDelete bool
 
 	// originalObjects store the objects created by users, identified by GVK and name.
 	// It serves as the source of truth for object controllers to propagate objects.
@@ -196,6 +197,15 @@ func (ns *Namespace) clean() {
 
 	// Remove from the forest.
 	delete(ns.forest.namespaces, ns.name)
+}
+
+func (ns *Namespace) AllowCascadingDelete() bool {
+	return ns.allowCascadingDelete
+}
+
+// SetExists marks this namespace as existing, returning true if didn't previously exist.
+func (ns *Namespace) SetAllowCascadingDelete(allow bool) {
+	ns.allowCascadingDelete = allow
 }
 
 // SetParent attempts to set the namespace's parent. This includes removing it from the list of
