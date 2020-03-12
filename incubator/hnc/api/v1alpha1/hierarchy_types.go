@@ -23,6 +23,7 @@ import (
 const (
 	Singleton               = "hierarchy"
 	HierarchyConfigurations = "hierarchyconfigurations"
+	Finalizer               = "hns.clean"
 )
 
 // Constants for labels and annotations

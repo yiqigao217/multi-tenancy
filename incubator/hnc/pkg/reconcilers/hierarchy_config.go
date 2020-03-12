@@ -26,6 +26,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -110,14 +111,38 @@ func (r *HierarchyConfigReconciler) reconcile(ctx context.Context, log logr.Logg
 	origHC := inst.DeepCopy()
 	origNS := nsInst.DeepCopy()
 
+	// Set a finalizer to make sure all hns instances are removed before this hc instance is deleted.
+	// We will unset the finalizer if all hns instances are gone when the object is being deleted.
 	// If either object exists but is being deleted, we won't update them when we're finished syncing
 	// (we should sync our internal data structure anyway just in case something's changed).  I'm not
 	// sure if this is the right thing to do but the kubebuilder boilerplate included this case
 	// explicitly.
 	update := true
-	if !inst.GetDeletionTimestamp().IsZero() || !nsInst.GetDeletionTimestamp().IsZero() {
-		log.Info("Singleton or namespace are being deleted; will not update")
-		update = false
+	if r.HNSReconcilerEnabled {
+		if !inst.GetDeletionTimestamp().IsZero() || !nsInst.GetDeletionTimestamp().IsZero() {
+			log.Info("Singleton or namespace are being deleted; will make sure all hns instances are gone")
+			// Make sure all existing hns instances are gone. Otherwise, return err to retry.
+			if hnss, err := r.getHierarchicalNamespaceNames(ctx, nm); err != nil || len(hnss) > 0 {
+				// TODO YG change this to real err, currently it may return nil
+				return err
+			}
+
+			log.Info("All hns instances are gone; the singleton will be deleted and will not be updated")
+			// Remove hns.clean finalizer
+			inst.ObjectMeta.Finalizers = removeString(inst.ObjectMeta.Finalizers, api.Finalizer)
+			// Update with apiserver immediately and don't update it again after syncWithForest.
+			log.Info("Updating singleton on apiserver to remove finalizer")
+			if err := r.Update(ctx, inst); err != nil {
+				log.Error(err, "while updating apiserver to remove finalizer")
+				return err
+			}
+			update = false
+		}
+	} else {
+		if !inst.GetDeletionTimestamp().IsZero() || !nsInst.GetDeletionTimestamp().IsZero() {
+			log.Info("Singleton or namespace are being deleted; will not update")
+			update = false
+		}
 	}
 
 	// Sync the Hierarchy singleton with the in-memory forest.
@@ -530,6 +555,11 @@ func (r *HierarchyConfigReconciler) writeHierarchy(ctx context.Context, log logr
 		return false, nil
 	}
 
+	// Make sure the finalizer is added to all hc instances.
+	if !containsString(inst.ObjectMeta.Finalizers, api.Finalizer) {
+		inst.ObjectMeta.Finalizers = append(inst.ObjectMeta.Finalizers, api.Finalizer)
+	}
+
 	stats.WriteHierConfig()
 	if inst.CreationTimestamp.IsZero() {
 		log.Info("Creating singleton on apiserver")
@@ -617,6 +647,50 @@ func (r *HierarchyConfigReconciler) getNamespace(ctx context.Context, nm string)
 		return &corev1.Namespace{}, nil
 	}
 	return ns, nil
+}
+
+// getHierarchicalNamespaceNames returns a list of the HierarchicalNamespace instance names in the
+// given namespace.
+func (r *HierarchyConfigReconciler) getHierarchicalNamespaceNames(ctx context.Context, nm string) ([]string, error) {
+	var hnsnms []string
+
+	// List all the hns instance in the namespace.
+	ul := &unstructured.UnstructuredList{}
+	ul.SetKind(api.HierarchicalNamespacesKind)
+	ul.SetAPIVersion(api.HierarchicalNamespacesAPIVersion)
+	if err := r.List(ctx, ul, client.InNamespace(nm)); err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, err
+		}
+		return hnsnms, nil
+	}
+
+	// Create a list of strings of the hns names.
+	for _, inst := range ul.Items {
+		hnsnms = append(hnsnms, inst.GetName())
+	}
+
+	return hnsnms, nil
+}
+
+// Helper functions to check and remove string from a slice of strings.
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(slice []string, s string) (result []string) {
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		result = append(result, item)
+	}
+	return
 }
 
 func (r *HierarchyConfigReconciler) SetupWithManager(mgr ctrl.Manager, maxReconciles int) error {
