@@ -3,7 +3,7 @@ _Part of the [HNC User Guide](README.md)_
 
 This document describes common tasks you might want to accomplish using HNC.
 
-## Table of contents
+
 
 * [Use hierarchical namespace](#use)
   * [Prepare to use hierarchical namespaces](#use-prepare)
